@@ -51,37 +51,70 @@ app.post('/webhook', (req, res) => {
     }
 });
 
+/**
+ * The Brain: Upgraded with Quick Replies
+ */
 function handleMessage(sender_id, message_text) {
     let text = message_text.toLowerCase();
-    let responseText = "";
-
+    
     if (text.includes("code")) {
-        responseText = "Here is our latest promo code: SAVE20!";
-        callSendAPI(sender_id, responseText);
+        callSendAPI(sender_id, "Here is our latest promo code: SAVE20!");
         
     } else if (text.includes("budget")) {
-        responseText = "Our custom projects usually range from $50 to $500. What did you have in mind?";
-        callSendAPI(sender_id, responseText);
+        callSendAPI(sender_id, "Our custom projects usually range from ₹500 to ₹5000. What did you have in mind?");
         
     } else if (text.includes("order")) {
-        responseText = "Awesome! I have notified our team to get your order started. What exactly would you like?";
-        callSendAPI(sender_id, responseText);
-        
-        // TRIGGER THE SUPABASE SAVE!
+        callSendAPI(sender_id, "Awesome! I have notified our team. What exactly would you like?");
         saveOrderToDatabase(sender_id, message_text);
         
     } else {
-        responseText = "Hi! Are you asking about a discount 'code', our 'budget' options, or placing an 'order'?";
-        callSendAPI(sender_id, responseText);
+        // THE UPGRADED WELCOME/FALLBACK MESSAGE
+        let welcomeText = "Hi there! 👋 I am the digital assistant. How can I help you today?";
+        
+        // Define the buttons we want to show
+        let quickReplies = [
+            {
+                content_type: "text",
+                title: "Discount Code 🎟️",
+                payload: "CHECK_CODE"
+            },
+            {
+                content_type: "text",
+                title: "Place an Order 📦",
+                payload: "PLACE_ORDER"
+            },
+            {
+                content_type: "text",
+                title: "Talk to a Person 🙋‍♂️",
+                payload: "TRIGGER_HUMAN_TAKEOVER"
+            }
+        ];
+
+        // Send the text along with the buttons
+        callSendAPI(sender_id, welcomeText, quickReplies);
     }
 }
 
-async function callSendAPI(sender_id, responseText) {
+/**
+ * The Voice: Upgraded to support Quick Replies
+ */
+async function callSendAPI(sender_id, text, quickReplies = null) {
     const url = `https://graph.facebook.com/v18.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`;
-    const payload = { recipient: { id: sender_id }, message: { text: responseText } };
+    
+    // Base payload with just text
+    let payload = {
+        recipient: { id: sender_id },
+        message: { text: text }
+    };
+
+    // If buttons were passed into the function, attach them to the payload
+    if (quickReplies) {
+        payload.message.quick_replies = quickReplies;
+    }
 
     try {
         await axios.post(url, payload);
+        console.log("📤 Message sent successfully!");
     } catch (error) {
         console.error("❌ Error sending message:", error.response ? error.response.data : error.message);
     }
