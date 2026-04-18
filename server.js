@@ -32,7 +32,7 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-// --- 2. WEBHOOK GATEKEEPER ---
+// --- 2. WEBHOOK GATEKEEPER (WITH SNOOZE CHECK) ---
 app.post('/webhook', async (req, res) => {
     let body = req.body;
 
@@ -41,10 +41,20 @@ app.post('/webhook', async (req, res) => {
             let webhook_event = entry.messaging[0];
             let sender_id = webhook_event.sender.id;
             
-            // GATEKEEPER: Get user state before replying
             let userData = await getUserData(sender_id);
             
-            // Pass the data to the brain
+            // CHECK IF BOT IS SNOOZED FOR THIS USER
+            if (userData.bot_paused_until) {
+                let unpauseTime = new Date(userData.bot_paused_until);
+                let currentTime = new Date();
+                
+                if (currentTime < unpauseTime) {
+                    console.log(`🤫 Bot is snoozed for ${sender_id}. Ignoring message.`);
+                    continue; // Skip the rest of the loop, bot stays silent
+                }
+            }
+            
+            // If not snoozed, pass to the brain
             await handleMessage(sender_id, webhook_event, userData);
         }
         res.status(200).send('EVENT_RECEIVED');
@@ -53,12 +63,12 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
-// --- 3. THE BRAIN (STATE MACHINE) ---
+// --- 3. THE BRAIN (STATE MACHINE & REGEX EXTRACTOR) ---
 async function handleMessage(sender_id, webhook_event, userData) {
     let currentState = userData.bot_state || 'IDLE';
     let tempData = userData.temp_order_data || {};
 
-    // Check if they clicked a Quick Reply button first
+    // Check for Quick Reply button clicks
     if (webhook_event.message && webhook_event.message.quick_reply) {
         let payload = webhook_event.message.quick_reply.payload;
         
@@ -67,8 +77,16 @@ async function handleMessage(sender_id, webhook_event, userData) {
             return callSendAPI(sender_id, "Great! Please use the share icon below the Instagram post of the product you want to buy, and send it directly into this chat.");
         }
         if (payload === "TRIGGER_HUMAN_TAKEOVER") {
-            // We will build the time-based snooze here next!
-            return callSendAPI(sender_id, "I've paused my automated replies. A human agent will jump in here shortly!");
+            // Calculate a time 5 hours from right now
+            let wakeUpTime = new Date();
+            wakeUpTime.setHours(wakeUpTime.getHours() + 5);
+            
+            await supabase
+                .from('customers')
+                .update({ bot_paused_until: wakeUpTime.toISOString(), bot_state: 'IDLE' })
+                .eq('instagram_user_id', sender_id);
+                
+            return callSendAPI(sender_id, "Got it! I've paused my automated replies. A human agent will jump in here shortly to help you out.");
         }
         if (payload === "CHECK_CODE") {
             return callSendAPI(sender_id, "Our current active promo code is SAVE20!");
@@ -83,25 +101,32 @@ async function handleMessage(sender_id, webhook_event, userData) {
             if (webhook_event.message && webhook_event.message.attachments && webhook_event.message.attachments[0].type === 'share') {
                 let sharedUrl = webhook_event.message.attachments[0].payload.url;
                 
-                // Clean the URL to remove tracking parameters (everything after '?')
-                let cleanUrl = sharedUrl.split('?')[0];
+                // NEW: Extract Shortcode using Regex
+                const regex = /\/(?:p|reels|tv)\/([^\/]+)/;
+                const match = sharedUrl.match(regex);
+                const shortcode = match ? match[1] : null;
 
-                // Query Supabase
-                let { data: product } = await supabase
-                    .from('products')
-                    .select('*')
-                    .ilike('insta_post_url', `%${cleanUrl}%`)
-                    .single();
+                if (shortcode) {
+                    console.log(`🔍 Searching Supabase for shortcode: ${shortcode}`);
+                    let { data: product } = await supabase
+                        .from('products')
+                        .select('*')
+                        .ilike('insta_post_url', `%${shortcode}%`)
+                        .single();
 
-                if (product) {
-                    tempData.product_id = product.id;
-                    tempData.product_name = product.product_name;
-                    tempData.price = product.price;
+                    if (product) {
+                        tempData.product_id = product.id;
+                        tempData.product_name = product.product_name;
+                        tempData.price = product.price;
 
-                    await updateUserState(sender_id, 'AWAITING_NAME', tempData);
-                    return callSendAPI(sender_id, `Ah, the ${product.product_name}! It is priced at ₹${product.price}. To start the order, what is your full name?`);
+                        await updateUserState(sender_id, 'AWAITING_NAME', tempData);
+                        return callSendAPI(sender_id, `Ah, the ${product.product_name}! It is priced at ₹${product.price}. To start the order, what is your full name?`);
+                    } else {
+                        console.log(`❌ No match found for shortcode: ${shortcode} in URL: ${sharedUrl}`);
+                        return callSendAPI(sender_id, "I couldn't find that exact product in our system. Are you sure that is the right post?");
+                    }
                 } else {
-                    return callSendAPI(sender_id, "I couldn't find that exact product in our system. Are you sure that is the right post?");
+                    return callSendAPI(sender_id, "I couldn't read the ID from that link. Please try sharing the post again!");
                 }
             } else {
                 return callSendAPI(sender_id, "Please use the airplane/share icon on the post to send it directly to me!");
@@ -119,10 +144,7 @@ async function handleMessage(sender_id, webhook_event, userData) {
             if (message_text) {
                 tempData.customer_address = message_text;
                 
-                // Finalize order
                 await finalizeOrderInDatabase(sender_id, tempData);
-                
-                // Reset state
                 await updateUserState(sender_id, 'IDLE', {});
                 return callSendAPI(sender_id, "Perfect! Your order has been logged. Our team will review it and get back to you shortly to arrange payment.");
             }
@@ -194,7 +216,6 @@ async function finalizeOrderInDatabase(sender_id, finalData) {
                 instagram_user_id: sender_id, 
                 original_message: `Order for ${finalData.product_name}`,
                 status: "Pending Verification",
-                // Storing the JSON data cleanly for your future admin app
                 order_details: finalData 
             }]);
         console.log(`✅ Order finalized for ${finalData.customer_name}`);
