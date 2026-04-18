@@ -101,13 +101,18 @@ async function handleMessage(sender_id, webhook_event, userData) {
             if (webhook_event.message && webhook_event.message.attachments && webhook_event.message.attachments[0].type === 'share') {
                 let sharedUrl = webhook_event.message.attachments[0].payload.url;
                 
-                // NEW: Extract Shortcode using Regex
-                const regex = /\/(?:p|reels|tv)\/([^\/]+)/;
-                const match = sharedUrl.match(regex);
+                // 1. CHOP OFF THE TRACKING DATA: Splits the URL at the '?' and keeps only the first part
+                let cleanUrl = sharedUrl.split('?')[0];
+                
+                // 2. EXTRACT THE SHORTCODE: Looks for /p/, /reel/, or /reels/ and grabs the ID after it
+                const regex = /\/(?:p|reels|reel|tv)\/([A-Za-z0-9_-]+)/i;
+                const match = cleanUrl.match(regex);
                 const shortcode = match ? match[1] : null;
 
                 if (shortcode) {
-                    console.log(`🔍 Searching Supabase for shortcode: ${shortcode}`);
+                    console.log(`✅ Successfully extracted Shortcode: ${shortcode}`);
+                    
+                    // 3. QUERY: Look for this exact Shortcode in Supabase
                     let { data: product } = await supabase
                         .from('products')
                         .select('*')
@@ -122,15 +127,17 @@ async function handleMessage(sender_id, webhook_event, userData) {
                         await updateUserState(sender_id, 'AWAITING_NAME', tempData);
                         return callSendAPI(sender_id, `Ah, the ${product.product_name}! It is priced at ₹${product.price}. To start the order, what is your full name?`);
                     } else {
-                        console.log(`❌ No match found for shortcode: ${shortcode} in URL: ${sharedUrl}`);
+                        console.log(`❌ Shortcode ${shortcode} not found in database.`);
                         return callSendAPI(sender_id, "I couldn't find that exact product in our system. Are you sure that is the right post?");
                     }
                 } else {
+                    console.log(`❌ Regex failed to find an ID in: ${cleanUrl}`);
                     return callSendAPI(sender_id, "I couldn't read the ID from that link. Please try sharing the post again!");
                 }
             } else {
                 return callSendAPI(sender_id, "Please use the airplane/share icon on the post to send it directly to me!");
             }
+            break; // Added break to ensure clean logic flow
 
         case 'AWAITING_NAME':
             if (message_text) {
