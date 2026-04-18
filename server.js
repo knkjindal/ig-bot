@@ -54,44 +54,53 @@ app.post('/webhook', (req, res) => {
 /**
  * The Brain: Upgraded with Quick Replies
  */
-function handleMessage(sender_id, message_text) {
-    let text = message_text.toLowerCase();
-    
-    if (text.includes("code")) {
-        callSendAPI(sender_id, "Here is our latest promo code: SAVE20!");
-        
-    } else if (text.includes("budget")) {
-        callSendAPI(sender_id, "Our custom projects usually range from ₹500 to ₹5000. What did you have in mind?");
-        
-    } else if (text.includes("order")) {
-        callSendAPI(sender_id, "Awesome! I have notified our team. What exactly would you like?");
-        saveOrderToDatabase(sender_id, message_text);
-        
-    } else {
-        // THE UPGRADED WELCOME/FALLBACK MESSAGE
-        let welcomeText = "Hi there! 👋 I am the digital assistant. How can I help you today?";
-        
-        // Define the buttons we want to show
-        let quickReplies = [
-            {
-                content_type: "text",
-                title: "Discount Code 🎟️",
-                payload: "CHECK_CODE"
-            },
-            {
-                content_type: "text",
-                title: "Place an Order 📦",
-                payload: "PLACE_ORDER"
-            },
-            {
-                content_type: "text",
-                title: "Talk to a Person 🙋‍♂️",
-                payload: "TRIGGER_HUMAN_TAKEOVER"
-            }
-        ];
+// Inside your webhook POST route, you first check the user's state in Supabase:
+// let userState = await getUserStateFromSupabase(sender_id);
 
-        // Send the text along with the buttons
-        callSendAPI(sender_id, welcomeText, quickReplies);
+async function handleMessage(sender_id, webhook_event, userState) {
+    // 1. Check if they clicked a button
+    if (webhook_event.message.quick_reply) {
+        let payload = webhook_event.message.quick_reply.payload;
+        
+        if (payload === "PLACE_ORDER") {
+            // Change DB state to 'AWAITING_PRODUCT'
+            await updateUserState(sender_id, 'AWAITING_PRODUCT');
+            return callSendAPI(sender_id, "Great! Please share the Instagram post of the product you want to buy into this chat.");
+        }
+    }
+
+    // 2. Handle the conversation based on their current "State"
+    switch (userState) {
+        case 'AWAITING_PRODUCT':
+            // Check if they shared a post
+            if (webhook_event.message.attachments && webhook_event.message.attachments[0].type === 'share') {
+                let sharedUrl = webhook_event.message.attachments[0].payload.url;
+                
+                // Query Supabase to find the product matching this URL
+                // let product = await findProduct(sharedUrl);
+                
+                // Update DB state to 'AWAITING_NAME'
+                await updateUserState(sender_id, 'AWAITING_NAME');
+                return callSendAPI(sender_id, `Ah! The [Product Name] is ₹[Price]. I'd love to help you order it. What is your full name?`);
+            } else {
+                return callSendAPI(sender_id, "Please use the share button on the post to send the product here so I can check the price!");
+            }
+
+        case 'AWAITING_NAME':
+            let customerName = webhook_event.message.text;
+            // Save name to temp_order_data in Supabase
+            await updateUserState(sender_id, 'AWAITING_ADDRESS');
+            return callSendAPI(sender_id, `Thanks, ${customerName}. And what is your delivery address?`);
+
+        case 'AWAITING_ADDRESS':
+            let customerAddress = webhook_event.message.text;
+            // Save address, move the final order to the pending_orders table, and reset state
+            await updateUserState(sender_id, 'IDLE');
+            return callSendAPI(sender_id, "Perfect! Your order is placed. Our team will verify it shortly.");
+
+        default:
+            // The IDLE state (Standard Keyword Checks / Welcome Message)
+            handleIdleConversation(sender_id, webhook_event.message.text);
     }
 }
 
