@@ -63,10 +63,24 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
-// --- 3. THE BRAIN (STATE MACHINE & REGEX EXTRACTOR) ---
+// --- 3. THE BRAIN (STATE MACHINE) ---
 async function handleMessage(sender_id, webhook_event, userData) {
     let currentState = userData.bot_state || 'IDLE';
     let tempData = userData.temp_order_data || {};
+
+    let message_text = webhook_event.message ? webhook_event.message.text : null;
+    let cancelBtn = [{ content_type: "text", title: "Cancel ❌", payload: "CANCEL_ORDER" }];
+
+    // --- GLOBAL ESCAPE HATCH (If they type "cancel" or "stop") ---
+    if (message_text && (message_text.toLowerCase() === 'cancel' || message_text.toLowerCase() === 'stop' || message_text.toLowerCase() === 'menu')) {
+        await updateUserState(sender_id, 'IDLE', {});
+        let quickReplies = [
+            { content_type: "text", title: "Discount Code 🎟️", payload: "CHECK_CODE" },
+            { content_type: "text", title: "Place an Order 📦", payload: "PLACE_ORDER" },
+            { content_type: "text", title: "Talk to a Person 🙋‍♂️", payload: "TRIGGER_HUMAN_TAKEOVER" }
+        ];
+        return callSendAPI(sender_id, "Got it, I've cancelled that process. How else can I help you?", quickReplies);
+    }
 
     // Check for Quick Reply button clicks
     if (webhook_event.message && webhook_event.message.quick_reply) {
@@ -74,10 +88,19 @@ async function handleMessage(sender_id, webhook_event, userData) {
         
         if (payload === "PLACE_ORDER") {
             await updateUserState(sender_id, 'AWAITING_PRODUCT', tempData);
-            return callSendAPI(sender_id, "Great! Please use the share icon below the Instagram post of the product you want to buy, and send it directly into this chat.");
+            return callSendAPI(sender_id, "Great! Please use the share icon below the Instagram post of the product you want to buy, or just paste the post link directly into this chat.", cancelBtn);
         }
+        
+        if (payload === "CANCEL_ORDER") {
+            await updateUserState(sender_id, 'IDLE', {});
+            let quickReplies = [
+                { content_type: "text", title: "Place an Order 📦", payload: "PLACE_ORDER" },
+                { content_type: "text", title: "Talk to a Person 🙋‍♂️", payload: "TRIGGER_HUMAN_TAKEOVER" }
+            ];
+            return callSendAPI(sender_id, "Order cancelled. What would you like to do instead?", quickReplies);
+        }
+
         if (payload === "TRIGGER_HUMAN_TAKEOVER") {
-            // Calculate a time 5 hours from right now
             let wakeUpTime = new Date();
             wakeUpTime.setHours(wakeUpTime.getHours() + 5);
             
@@ -88,63 +111,75 @@ async function handleMessage(sender_id, webhook_event, userData) {
                 
             return callSendAPI(sender_id, "Got it! I've paused my automated replies. A human agent will jump in here shortly to help you out.");
         }
+        
         if (payload === "CHECK_CODE") {
             return callSendAPI(sender_id, "Our current active promo code is SAVE20!");
         }
     }
 
-    let message_text = webhook_event.message ? webhook_event.message.text : null;
-
     // Route conversation based on their current state
     switch (currentState) {
         case 'AWAITING_PRODUCT':
-            if (webhook_event.message && webhook_event.message.attachments && webhook_event.message.attachments[0].type === 'share') {
+            let shortcode = null;
+
+            // 1. FIRST CHECK: Did they just paste the link into the chat as text?
+            if (message_text) {
+                const textRegex = /\/(?:p|reels|reel|tv)\/([A-Za-z0-9_-]+)/i;
+                const textMatch = message_text.match(textRegex);
+                if (textMatch) {
+                    shortcode = textMatch[1];
+                    console.log(`✅ Extracted Shortcode from pasted text: ${shortcode}`);
+                }
+            }
+
+            // 2. SECOND CHECK: Did they use the Share button?
+            if (!shortcode && webhook_event.message && webhook_event.message.attachments && webhook_event.message.attachments[0].type === 'share') {
                 let sharedUrl = webhook_event.message.attachments[0].payload.url;
+                console.log(`🔗 RAW URL FROM META: ${sharedUrl}`);
                 
-                // 1. CHOP OFF THE TRACKING DATA: Splits the URL at the '?' and keeps only the first part
+                // If Meta sends an internal image link, we can't extract an ID
+                if (sharedUrl.includes('lookaside.fbsbx.com')) {
+                    return callSendAPI(sender_id, "Instagram hid the product link from me! 🕵️‍♂️ Could you do me a favor? Tap the 3 dots on the post, click 'Copy Link', and just paste it here for me.", cancelBtn);
+                }
+
                 let cleanUrl = sharedUrl.split('?')[0];
-                
-                // 2. EXTRACT THE SHORTCODE: Looks for /p/, /reel/, or /reels/ and grabs the ID after it
                 const regex = /\/(?:p|reels|reel|tv)\/([A-Za-z0-9_-]+)/i;
                 const match = cleanUrl.match(regex);
-                const shortcode = match ? match[1] : null;
+                if (match) {
+                    shortcode = match[1];
+                    console.log(`✅ Extracted Shortcode from shared post: ${shortcode}`);
+                }
+            }
 
-                if (shortcode) {
-                    console.log(`✅ Successfully extracted Shortcode: ${shortcode}`);
-                    
-                    // 3. QUERY: Look for this exact Shortcode in Supabase
-                    // 3. QUERY: Exact match for the Shortcode in Supabase
-                    let { data: product } = await supabase
-                        .from('products')
-                        .select('*')
-                        .eq('insta_shortcode', shortcode) // Changed from .ilike to .eq
-                        .single();
+            // 3. IF WE FOUND AN ID (Either from text or share), QUERY DATABASE
+            if (shortcode) {
+                let { data: product } = await supabase
+                    .from('products')
+                    .select('*')
+                    .ilike('insta_post_url', `%${shortcode}%`)
+                    .single();
 
-                    if (product) {
-                        tempData.product_id = product.id;
-                        tempData.product_name = product.product_name;
-                        tempData.price = product.price;
+                if (product) {
+                    tempData.product_id = product.id;
+                    tempData.product_name = product.product_name;
+                    tempData.price = product.price;
 
-                        await updateUserState(sender_id, 'AWAITING_NAME', tempData);
-                        return callSendAPI(sender_id, `Ah, the ${product.product_name}! It is priced at ₹${product.price}. To start the order, what is your full name?`);
-                    } else {
-                        console.log(`❌ Shortcode ${shortcode} not found in database.`);
-                        return callSendAPI(sender_id, "I couldn't find that exact product in our system. Are you sure that is the right post?");
-                    }
+                    await updateUserState(sender_id, 'AWAITING_NAME', tempData);
+                    return callSendAPI(sender_id, `Ah, the ${product.product_name}! It is priced at ₹${product.price}. To start the order, what is your full name?`, cancelBtn);
                 } else {
-                    console.log(`❌ Regex failed to find an ID in: ${cleanUrl}`);
-                    return callSendAPI(sender_id, "I couldn't read the ID from that link. Please try sharing the post again!");
+                    return callSendAPI(sender_id, "I couldn't find that exact product in our system. Are you sure that is the right post?", cancelBtn);
                 }
             } else {
-                return callSendAPI(sender_id, "Please use the airplane/share icon on the post to send it directly to me!");
+                // FALLBACK: If no text link and no valid share attachment
+                return callSendAPI(sender_id, "I couldn't find a product link! Please copy the link from the Instagram post and paste it here, or click below to cancel.", cancelBtn);
             }
-            break; // Added break to ensure clean logic flow
+            break;
 
         case 'AWAITING_NAME':
             if (message_text) {
                 tempData.customer_name = message_text;
                 await updateUserState(sender_id, 'AWAITING_ADDRESS', tempData);
-                return callSendAPI(sender_id, `Thanks, ${message_text}! And what is your full delivery address?`);
+                return callSendAPI(sender_id, `Thanks, ${message_text}! And what is your full delivery address?`, cancelBtn);
             }
             break;
 
@@ -153,8 +188,16 @@ async function handleMessage(sender_id, webhook_event, userData) {
                 tempData.customer_address = message_text;
                 
                 await finalizeOrderInDatabase(sender_id, tempData);
+                
+                // Reset state to IDLE and show the main menu again!
                 await updateUserState(sender_id, 'IDLE', {});
-                return callSendAPI(sender_id, "Perfect! Your order has been logged. Our team will review it and get back to you shortly to arrange payment.");
+                let successReplies = [
+                    { content_type: "text", title: "Discount Code 🎟️", payload: "CHECK_CODE" },
+                    { content_type: "text", title: "Place Another Order 📦", payload: "PLACE_ORDER" },
+                    { content_type: "text", title: "Talk to a Person 🙋‍♂️", payload: "TRIGGER_HUMAN_TAKEOVER" }
+                ];
+                
+                return callSendAPI(sender_id, "Perfect! Your order has been logged. Our team will review it and get back to you shortly to arrange payment. Is there anything else I can help you with?", successReplies);
             }
             break;
 
