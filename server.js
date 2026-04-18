@@ -6,7 +6,7 @@ const axios = require("axios");
 // --- SUPABASE SETUP ---
 const { createClient } = require('@supabase/supabase-js');
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY; // Using Service Key so the bot bypasses RLS
 const supabase = createClient(supabaseUrl, supabaseKey);
 // ----------------------
 
@@ -40,8 +40,15 @@ app.post('/webhook', async (req, res) => {
         for (let entry of body.entry) {
             let webhook_event = entry.messaging[0];
             let sender_id = webhook_event.sender.id;
+            let page_id = webhook_event.recipient.id; // NEW: Get the Business's IG Page ID
             
-            let userData = await getUserData(sender_id);
+            // Fetch user data scoped to this specific client
+            let userData = await getUserData(sender_id, page_id);
+            
+            if (!userData) {
+                console.log(`⚠️ Unregistered page messaged: ${page_id}`);
+                continue; // Ignore messages to pages not in our profiles table
+            }
             
             // CHECK IF BOT IS SNOOZED FOR THIS USER
             if (userData.bot_paused_until) {
@@ -50,7 +57,7 @@ app.post('/webhook', async (req, res) => {
                 
                 if (currentTime < unpauseTime) {
                     console.log(`🤫 Bot is snoozed for ${sender_id}. Ignoring message.`);
-                    continue; // Skip the rest of the loop, bot stays silent
+                    continue; 
                 }
             }
             
@@ -67,13 +74,14 @@ app.post('/webhook', async (req, res) => {
 async function handleMessage(sender_id, webhook_event, userData) {
     let currentState = userData.bot_state || 'IDLE';
     let tempData = userData.temp_order_data || {};
+    let clientId = userData.client_id; // Extract the specific client ID
 
     let message_text = webhook_event.message ? webhook_event.message.text : null;
     let cancelBtn = [{ content_type: "text", title: "Cancel ❌", payload: "CANCEL_ORDER" }];
 
-    // --- GLOBAL ESCAPE HATCH (If they type "cancel" or "stop") ---
+    // --- GLOBAL ESCAPE HATCH ---
     if (message_text && (message_text.toLowerCase() === 'cancel' || message_text.toLowerCase() === 'stop' || message_text.toLowerCase() === 'menu')) {
-        await updateUserState(sender_id, 'IDLE', {});
+        await updateUserState(sender_id, clientId, 'IDLE', {});
         let quickReplies = [
             { content_type: "text", title: "Discount Code 🎟️", payload: "CHECK_CODE" },
             { content_type: "text", title: "Place an Order 📦", payload: "PLACE_ORDER" },
@@ -87,12 +95,12 @@ async function handleMessage(sender_id, webhook_event, userData) {
         let payload = webhook_event.message.quick_reply.payload;
         
         if (payload === "PLACE_ORDER") {
-            await updateUserState(sender_id, 'AWAITING_PRODUCT', tempData);
+            await updateUserState(sender_id, clientId, 'AWAITING_PRODUCT', tempData);
             return callSendAPI(sender_id, "Great! Please use the share icon below the Instagram post of the product you want to buy, or just paste the post link directly into this chat.", cancelBtn);
         }
         
         if (payload === "CANCEL_ORDER") {
-            await updateUserState(sender_id, 'IDLE', {});
+            await updateUserState(sender_id, clientId, 'IDLE', {});
             let quickReplies = [
                 { content_type: "text", title: "Place an Order 📦", payload: "PLACE_ORDER" },
                 { content_type: "text", title: "Talk to a Person 🙋‍♂️", payload: "TRIGGER_HUMAN_TAKEOVER" }
@@ -107,7 +115,8 @@ async function handleMessage(sender_id, webhook_event, userData) {
             await supabase
                 .from('customers')
                 .update({ bot_paused_until: wakeUpTime.toISOString(), bot_state: 'IDLE' })
-                .eq('instagram_user_id', sender_id);
+                .eq('instagram_user_id', sender_id)
+                .eq('client_id', clientId); // Scoped to client
                 
             return callSendAPI(sender_id, "Got it! I've paused my automated replies. A human agent will jump in here shortly to help you out.");
         }
@@ -122,41 +131,29 @@ async function handleMessage(sender_id, webhook_event, userData) {
         case 'AWAITING_PRODUCT':
             let shortcode = null;
 
-            // 1. FIRST CHECK: Did they just paste the link into the chat as text?
             if (message_text) {
                 const textRegex = /\/(?:p|reels|reel|tv)\/([A-Za-z0-9_-]+)/i;
                 const textMatch = message_text.match(textRegex);
-                if (textMatch) {
-                    shortcode = textMatch[1];
-                    console.log(`✅ Extracted Shortcode from pasted text: ${shortcode}`);
-                }
+                if (textMatch) shortcode = textMatch[1];
             }
 
-            // 2. SECOND CHECK: Did they use the Share button?
             if (!shortcode && webhook_event.message && webhook_event.message.attachments && webhook_event.message.attachments[0].type === 'share') {
                 let sharedUrl = webhook_event.message.attachments[0].payload.url;
-                console.log(`🔗 RAW URL FROM META: ${sharedUrl}`);
-                
-                // If Meta sends an internal image link, we can't extract an ID
                 if (sharedUrl.includes('lookaside.fbsbx.com')) {
                     return callSendAPI(sender_id, "Instagram hid the product link from me! 🕵️‍♂️ Could you do me a favor? Tap the 3 dots on the post, click 'Copy Link', and just paste it here for me.", cancelBtn);
                 }
-
                 let cleanUrl = sharedUrl.split('?')[0];
                 const regex = /\/(?:p|reels|reel|tv)\/([A-Za-z0-9_-]+)/i;
                 const match = cleanUrl.match(regex);
-                if (match) {
-                    shortcode = match[1];
-                    console.log(`✅ Extracted Shortcode from shared post: ${shortcode}`);
-                }
+                if (match) shortcode = match[1];
             }
 
-            // 3. IF WE FOUND AN ID (Either from text or share), QUERY DATABASE
             if (shortcode) {
                 let { data: product } = await supabase
                     .from('products')
                     .select('*')
                     .ilike('insta_post_url', `%${shortcode}%`)
+                    .eq('client_id', clientId) // NEW: Only search this specific client's products!
                     .single();
 
                 if (product) {
@@ -164,13 +161,12 @@ async function handleMessage(sender_id, webhook_event, userData) {
                     tempData.product_name = product.product_name;
                     tempData.price = product.price;
 
-                    await updateUserState(sender_id, 'AWAITING_NAME', tempData);
+                    await updateUserState(sender_id, clientId, 'AWAITING_NAME', tempData);
                     return callSendAPI(sender_id, `Ah, the ${product.product_name}! It is priced at ₹${product.price}. To start the order, what is your full name?`, cancelBtn);
                 } else {
                     return callSendAPI(sender_id, "I couldn't find that exact product in our system. Are you sure that is the right post?", cancelBtn);
                 }
             } else {
-                // FALLBACK: If no text link and no valid share attachment
                 return callSendAPI(sender_id, "I couldn't find a product link! Please copy the link from the Instagram post and paste it here, or click below to cancel.", cancelBtn);
             }
             break;
@@ -178,7 +174,7 @@ async function handleMessage(sender_id, webhook_event, userData) {
         case 'AWAITING_NAME':
             if (message_text) {
                 tempData.customer_name = message_text;
-                await updateUserState(sender_id, 'AWAITING_ADDRESS', tempData);
+                await updateUserState(sender_id, clientId, 'AWAITING_ADDRESS', tempData);
                 return callSendAPI(sender_id, `Thanks, ${message_text}! And what is your full delivery address?`, cancelBtn);
             }
             break;
@@ -186,36 +182,30 @@ async function handleMessage(sender_id, webhook_event, userData) {
         case 'AWAITING_ADDRESS':
             if (message_text) {
                 tempData.customer_address = message_text;
+                await updateUserState(sender_id, clientId, 'AWAITING_PAYMENT', tempData);
                 
-                // Move them to the new payment state instead of finalizing the order!
-                await updateUserState(sender_id, 'AWAITING_PAYMENT', tempData);
-                
-                return callSendAPI(sender_id, `Perfect! Your total is ₹${tempData.price}. Please make the payment via UPI to 'yourbusiness@upi' and upload the payment screenshot here.`, cancelBtn);
+                // Uses the client's specific UPI ID if available, otherwise falls back
+                let clientUpi = userData.upi_id || "yourbusiness@upi";
+                return callSendAPI(sender_id, `Perfect! Your total is ₹${tempData.price}. Please make the payment via UPI to '${clientUpi}' and upload the payment screenshot here.`, cancelBtn);
             }
             break;
 
         case 'AWAITING_PAYMENT':
-            // Check if the user uploaded an image attachment
             if (webhook_event.message && webhook_event.message.attachments && webhook_event.message.attachments[0].type === 'image') {
                 let imageUrl = webhook_event.message.attachments[0].payload.url;
-                
-                // Save the image URL into the order data
                 tempData.payment_screenshot = imageUrl;
                 
-                // Now we finalize the order in the database!
-                await finalizeOrderInDatabase(sender_id, tempData);
+                // Finalize order with the client_id tag
+                await finalizeOrderInDatabase(sender_id, clientId, tempData);
                 
-                // Reset state to IDLE and show the main menu again
-                await updateUserState(sender_id, 'IDLE', {});
+                await updateUserState(sender_id, clientId, 'IDLE', {});
                 let successReplies = [
                     { content_type: "text", title: "Discount Code 🎟️", payload: "CHECK_CODE" },
                     { content_type: "text", title: "Place Another Order 📦", payload: "PLACE_ORDER" },
                     { content_type: "text", title: "Talk to a Person 🙋‍♂️", payload: "TRIGGER_HUMAN_TAKEOVER" }
                 ];
-                
                 return callSendAPI(sender_id, "Screenshot received! 📸 Our team is verifying the payment and will send your confirmation shortly.", successReplies);
             } else {
-                // If they typed text instead of uploading a picture
                 return callSendAPI(sender_id, "I need a screenshot of the payment to proceed! Please upload the image, or click below to cancel.", cancelBtn);
             }
             break;
@@ -252,66 +242,84 @@ async function callSendAPI(sender_id, text, quickReplies = null) {
     }
 }
 
-// --- 5. SUPABASE HELPERS ---
-async function getUserData(sender_id) {
-    let { data } = await supabase
+// --- 5. SUPABASE HELPERS (SaaS Upgraded) ---
+async function getUserData(sender_id, page_id) {
+    // 1. Identify which client this Instagram Page belongs to
+    let { data: profile } = await supabase
+        .from('profiles')
+        .select('id, upi_id')
+        .eq('insta_page_id', page_id)
+        .single();
+
+    if (!profile) return null; // Exit if the page isn't in our system yet
+    
+    const clientId = profile.id;
+
+    // 2. Look for the customer under this specific client
+    let { data: customer } = await supabase
         .from('customers')
         .select('*')
         .eq('instagram_user_id', sender_id)
+        .eq('client_id', clientId)
         .single();
 
-    if (!data) {
+    if (!customer) {
         const { data: newUser } = await supabase
             .from('customers')
-            .insert([{ instagram_user_id: sender_id, bot_state: 'IDLE', temp_order_data: {} }])
+            .insert([{ 
+                instagram_user_id: sender_id, 
+                client_id: clientId, // Tag the owner!
+                bot_state: 'IDLE', 
+                temp_order_data: {} 
+            }])
             .select()
             .single();
+        newUser.upi_id = profile.upi_id; // Attach temporarily for the bot to use
         return newUser;
     }
-    return data;
+    customer.upi_id = profile.upi_id;
+    return customer;
 }
 
-async function updateUserState(sender_id, newState, tempData = {}) {
+async function updateUserState(sender_id, client_id, newState, tempData = {}) {
     await supabase
         .from('customers')
         .update({ bot_state: newState, temp_order_data: tempData })
-        .eq('instagram_user_id', sender_id);
+        .eq('instagram_user_id', sender_id)
+        .eq('client_id', client_id); // Scoped update
 }
 
-async function finalizeOrderInDatabase(sender_id, finalData) {
+async function finalizeOrderInDatabase(sender_id, client_id, finalData) {
     try {
         await supabase
             .from('pending_orders')
             .insert([{ 
+                client_id: client_id, // Link order to the correct business
                 instagram_user_id: sender_id, 
                 original_message: `Order for ${finalData.product_name}`,
                 status: "Pending Verification",
                 order_details: finalData 
             }]);
-        console.log(`✅ Order finalized for ${finalData.customer_name}`);
+        console.log(`✅ Order finalized for ${finalData.customer_name} under client ${client_id}`);
     } catch (error) {
         console.error("❌ Error finalizing order:", error);
     }
 }
 
 // --- 6. ADMIN COMMAND CENTER API ---
-// The Flutter app will send a POST request here when the admin verifies a payment
 app.post('/api/verify-order', async (req, res) => {
     const { admin_secret, instagram_user_id, order_id } = req.body;
 
-    // A simple security check so random people can't trigger your bot
     if (admin_secret !== process.env.ADMIN_SECRET) {
         return res.status(403).send("Unauthorized: Invalid Admin Secret");
     }
 
     try {
-        // 1. Update the order status in Supabase to 'Confirmed'
         await supabase
             .from('pending_orders')
             .update({ status: 'Confirmed' })
             .eq('id', order_id);
 
-        // 2. Make the bot send a DM to the customer
         await callSendAPI(instagram_user_id, "🎉 Great news! Your payment has been verified and your order is confirmed. We are packing it up now!");
 
         res.status(200).send("Order verified and customer notified!");
@@ -322,5 +330,5 @@ app.post('/api/verify-order', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🔥 Server running on port ${PORT}`);
+  console.log(`🔥 Multi-Tenant Server running on port ${PORT}`);
 });
