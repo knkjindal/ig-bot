@@ -187,9 +187,25 @@ async function handleMessage(sender_id, webhook_event, userData) {
             if (message_text) {
                 tempData.customer_address = message_text;
                 
+                // Move them to the new payment state instead of finalizing the order!
+                await updateUserState(sender_id, 'AWAITING_PAYMENT', tempData);
+                
+                return callSendAPI(sender_id, `Perfect! Your total is ₹${tempData.price}. Please make the payment via UPI to 'yourbusiness@upi' and upload the payment screenshot here.`, cancelBtn);
+            }
+            break;
+
+        case 'AWAITING_PAYMENT':
+            // Check if the user uploaded an image attachment
+            if (webhook_event.message && webhook_event.message.attachments && webhook_event.message.attachments[0].type === 'image') {
+                let imageUrl = webhook_event.message.attachments[0].payload.url;
+                
+                // Save the image URL into the order data
+                tempData.payment_screenshot = imageUrl;
+                
+                // Now we finalize the order in the database!
                 await finalizeOrderInDatabase(sender_id, tempData);
                 
-                // Reset state to IDLE and show the main menu again!
+                // Reset state to IDLE and show the main menu again
                 await updateUserState(sender_id, 'IDLE', {});
                 let successReplies = [
                     { content_type: "text", title: "Discount Code 🎟️", payload: "CHECK_CODE" },
@@ -197,7 +213,10 @@ async function handleMessage(sender_id, webhook_event, userData) {
                     { content_type: "text", title: "Talk to a Person 🙋‍♂️", payload: "TRIGGER_HUMAN_TAKEOVER" }
                 ];
                 
-                return callSendAPI(sender_id, "Perfect! Your order has been logged. Our team will review it and get back to you shortly to arrange payment. Is there anything else I can help you with?", successReplies);
+                return callSendAPI(sender_id, "Screenshot received! 📸 Our team is verifying the payment and will send your confirmation shortly.", successReplies);
+            } else {
+                // If they typed text instead of uploading a picture
+                return callSendAPI(sender_id, "I need a screenshot of the payment to proceed! Please upload the image, or click below to cancel.", cancelBtn);
             }
             break;
 
@@ -274,6 +293,33 @@ async function finalizeOrderInDatabase(sender_id, finalData) {
         console.error("❌ Error finalizing order:", error);
     }
 }
+
+// --- 6. ADMIN COMMAND CENTER API ---
+// The Flutter app will send a POST request here when the admin verifies a payment
+app.post('/api/verify-order', async (req, res) => {
+    const { admin_secret, instagram_user_id, order_id } = req.body;
+
+    // A simple security check so random people can't trigger your bot
+    if (admin_secret !== process.env.ADMIN_SECRET) {
+        return res.status(403).send("Unauthorized: Invalid Admin Secret");
+    }
+
+    try {
+        // 1. Update the order status in Supabase to 'Confirmed'
+        await supabase
+            .from('pending_orders')
+            .update({ status: 'Confirmed' })
+            .eq('id', order_id);
+
+        // 2. Make the bot send a DM to the customer
+        await callSendAPI(instagram_user_id, "🎉 Great news! Your payment has been verified and your order is confirmed. We are packing it up now!");
+
+        res.status(200).send("Order verified and customer notified!");
+    } catch (error) {
+        console.error("❌ API Error:", error);
+        res.status(500).send("Internal Server Error");
+    }
+});
 
 app.listen(PORT, () => {
   console.log(`🔥 Server running on port ${PORT}`);
