@@ -113,10 +113,11 @@ async function handleMessage(sender_id, webhook_event, userData) {
                     console.log(`✅ Successfully extracted Shortcode: ${shortcode}`);
                     
                     // 3. QUERY: Look for this exact Shortcode in Supabase
+                    // 3. QUERY: Exact match for the Shortcode in Supabase
                     let { data: product } = await supabase
                         .from('products')
                         .select('*')
-                        .ilike('insta_post_url', `%${shortcode}%`)
+                        .eq('insta_shortcode', shortcode) // Changed from .ilike to .eq
                         .single();
 
                     if (product) {
