@@ -32,6 +32,17 @@ app.get("/webhook", (req, res) => {
   }
 });
 
+// --- PRIVACY POLICY ROUTE (For Meta Approval) ---
+app.get("/privacy", (req, res) => { 
+  res.send(`
+    <h1>Privacy Policy</h1>
+    <p>This application is an Instagram Automation tool for businesses.</p>
+    <p>1. We only collect the necessary data (Instagram Page IDs, Access Tokens) required to automate messaging on your behalf.</p>
+    <p>2. We do not sell or share your data with third parties.</p>
+    <p>3. You can request data deletion at any time by contacting the administrator.</p>
+  `); 
+});
+
 // --- 2. WEBHOOK GATEKEEPER (WITH SNOOZE CHECK) ---
 app.post('/webhook', async (req, res) => {
     let body = req.body;
